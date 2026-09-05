@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /home/thebevans/.hermes/court-rulings
+cd "$HOME/.hermes/court-rulings"
 python3 -c "
 import urllib.request, xml.etree.ElementTree as ET
 
