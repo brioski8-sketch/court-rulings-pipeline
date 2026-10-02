@@ -13,6 +13,19 @@ from datetime import datetime, timezone
 from collections import Counter, defaultdict
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+# classify.py is the single source of truth for classification + Ontario-first ranking.
+# Do not reintroduce a local copy of the keyword lists here — the podcast had one too
+# and the two drifted apart.
+from classify import (classify_ruling, rank_key, resolve_fingerprint,  # noqa: E402
+                      JP_BUCKET_ORDER, JP_BUCKET_LABELS,
+                      decision_date_of, window_start_iso)
+
+# Rolling window, in days, on the DECISION date. The briefing runs weekly on Monday, so
+# 7 days back is the previous Monday, inclusive. Matches the podcast's WINDOW_DAYS and the
+# dashboard's date column — all three use classify.decision_date_of.
+WINDOW_DAYS = 7
+
 DATA_DIR = os.path.join(BASE_DIR, "data")
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 LAST_RUN_FILE = os.path.join(REPORTS_DIR, ".last_report")
@@ -57,23 +70,13 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
 def get_last_report_cutoff():
-    """Determine cutoff date — only report on data files from after the last briefing."""
-    marker = LAST_RUN_FILE
-    if os.path.exists(marker):
-        with open(marker) as f:
-            ts = f.read().strip()
-            if ts:
-                return ts[:10]  # YYYY-MM-DD
-    
-    # Fallback: find most recent briefing file
-    briefings = sorted(glob.glob(os.path.join(REPORTS_DIR, "briefing_*.txt")), reverse=True)
-    if briefings:
-        m = re.search(r'briefing_(\d{4}-\d{2}-\d{2})\.txt', briefings[0])
-        if m:
-            return m.group(1)
-    
-    # First run ever — last 7 days
-    return (datetime.now(timezone.utc) - __import__('datetime').timedelta(days=7)).strftime('%Y-%m-%d')
+    """Inclusive start of the rolling DECISION-date window (previous Monday).
+
+    Replaces the old `.last_report` marker, which made the window depend on when the last
+    run happened to fire (and coupled the briefing to run order). Fixed at WINDOW_DAYS so
+    the briefing, the podcast and the dashboard all cover the same week.
+    """
+    return window_start_iso(WINDOW_DAYS)
 
 
 def load_recent_data(prefix, cutoff_date=None):
@@ -102,8 +105,30 @@ def load_recent_data(prefix, cutoff_date=None):
     return entries
 
 
-def classify_ruling(item):
-    """Classify a ruling by subject matter and identify precedent potential."""
+def merge_records(records):
+    """Collapse the same case arriving from several sources into one record.
+
+    Keeps the FIRST record seen for each fingerprint, which is why the loader feeds
+    the richest tier first (federal_ -> scc_ -> canlii_ -> rulings_). A full-text
+    record must never be replaced by the bare SCC feed record for the same case.
+    """
+    seen, out = set(), []
+    for rec in records:
+        fp = resolve_fingerprint(rec)
+        if fp and fp in seen:
+            continue
+        if fp:
+            seen.add(fp)
+        out.append(rec)
+    return out
+
+
+def _legacy_classify_ruling(item):
+    """DEPRECATED — superseded by classify.classify_ruling (imported above).
+
+    Kept briefly so this change stays reviewable; delete once the shared classifier
+    has run clean through a full pipeline cycle. Do not call this.
+    """
     title = item.get("title", "").lower()
     desc = item.get("description", "").lower()
     subjects = [s.lower() for s in item.get("subjects", [])]
@@ -196,12 +221,18 @@ def generate_briefing(rulings):
         info["item"] = r
         classified.append(info)
 
-    court_order = {"scc": 0, "onca": 1, "fca": 2, "fct": 3, "onsc": 4, "onscdc": 5, "oncj": 6}
-    classified.sort(key=lambda x: (-x["precedent_score"], court_order.get(x["item"].get("court", ""), 99)))
+    # Ontario-first ordering (classify.rank_key): Ontario criminal/LE matters lead, then
+    # SCC criminal/LE, then everything else, then historical backfill. Replaces the old
+    # SCC-first precedent sort, which buried the local courts HPS actually works in.
+    classified.sort(key=rank_key)
 
+    # Count only decisions that are actually in-window. The SCC feed snapshot contains
+    # the entire year's corpus; tallying all of it made the briefing claim 32 fresh SCC
+    # rulings in a week where there was one.
     court_counts = Counter()
     for c in classified:
-        court_counts[c["item"].get("court", "?")] += 1
+        if c.get("is_recent", True):
+            court_counts[c["item"].get("court", "?")] += 1
 
     all_subjects = Counter()
     for c in classified:
@@ -209,14 +240,52 @@ def generate_briefing(rulings):
             all_subjects[s] += 1
 
     crime_rulings = [c for c in classified if c["is_criminal"]]
+    tier_counts = Counter(c.get("coverage_tier", "metadata_only") for c in classified)
+
+    # JP docket sections. Each takes Ontario matters first, then non-Ontario, so a busy
+    # Ontario week cannot crowd out a full-text SCC/Federal judgment — the same failure
+    # that once made the briefing retrieve 25 real judgments and display none.
+    def _pick(name, n_ontario, n_other):
+        b = [c for c in classified if c.get("jp_bucket") == name]
+        return ([c for c in b if c.get("is_ontario")][:n_ontario]
+                + [c for c in b if not c.get("is_ontario")][:n_other])
+
+    jp_sections = {
+        "charter":    _pick("charter", 4, 2),
+        "bail":       _pick("bail", 3, 1),
+        "provincial": _pick("provincial", 4, 1),
+        "criminal":   _pick("criminal", 4, 3),
+        "other":      _pick("other", 3, 2),
+    }
+    _shown = {id(c) for picks in jp_sections.values() for c in picks}
+    # Only JP-relevant full judgments. Without the bucket filter this section filled up
+    # with Federal Court immigration decisions - retrieved in full, but not a JP's docket.
+    fulltext_leftover = [c for c in classified
+                         if c.get("coverage_tier") == "full_text"
+                         and id(c) not in _shown
+                         and c.get("jp_bucket") != "other"][:5]
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "total_rulings": len(rulings),
+        "tier_counts": dict(tier_counts),
+        "ontario_rulings": sum(1 for c in classified if c.get("is_ontario")),
         "court_counts": dict(court_counts),
         "top_subjects": all_subjects.most_common(15),
         "criminal_rulings": len(crime_rulings),
+        # JP docket: what the brief actually leads with. Counts are in-window only.
+        "jp_counts": dict(Counter(c.get("jp_bucket") for c in classified
+                                  if c.get("is_recent", True))),
+        "jp_sections": jp_sections,
+        "fulltext_leftover": fulltext_leftover,
         "highest_precedent": classified[:10],
+        # Curated the way the briefing renders: what the local courts decided, and the
+        # judgments held in full. Ontario-first ordering alone buried every full-text
+        # judgment beneath 33 Ontario synopses.
+        "ontario_top": [c for c in classified if c.get("is_ontario")][:6],
+        "fulltext_top": [c for c in classified
+                         if c.get("coverage_tier") == "full_text"
+                         and not c.get("is_ontario")][:5],
         "all": classified,
     }
 
@@ -225,17 +294,42 @@ def format_briefing_text(briefing, hansard_analysis):
     """Format the briefing as readable text."""
     lines = []
     lines.append("\u2550" * 60)
-    lines.append("  COURT RULINGS & LEGISLATIVE BRIEFING")
+    lines.append("  COURT RULINGS & LEGISLATIVE BRIEFING \u2014 JP EDITION")
     lines.append(f"  {briefing['timestamp']}")
     lines.append("\u2550" * 60)
     lines.append("")
 
     # ── Rulings Summary ──
     lines.append(f"Total rulings found: {briefing['total_rulings']}")
-    lines.append(f"Criminal law rulings: {briefing['criminal_rulings']}")
+    lines.append(f"  of which Ontario: {briefing.get('ontario_rulings', 0)}")
     lines.append("")
 
-    lines.append("BY COURT:")
+    # ── Coverage statement ──
+    # Required by our own analytical discipline: state what could and could not be
+    # seen. A synopsis is not a judgment and this briefing must never imply otherwise.
+    tiers = briefing.get("tier_counts", {})
+    lines.append("COVERAGE — what this briefing is based on:")
+    lines.append(f"  Full judgment text retrieved: {tiers.get('full_text', 0)}")
+    lines.append(f"  Court synopsis only (not the judgment): {tiers.get('metadata_only', 0)}")
+    lines.append("  Ontario rulings carry CanLII's structured synopsis — charge, statute and")
+    lines.append("  section, legal issue, authorities applied, disposition — but NOT the")
+    lines.append("  judgment text. canlii.org and ontariocourts.ca both forbid automated")
+    lines.append("  retrieval, so Ontario full text is not collected. Do not read a synopsis")
+    lines.append("  as the court's reasoning.")
+    lines.append("")
+
+    # JP DOCKET AT A GLANCE - the reading order below is Charter, bail, provincial
+    # offences, criminal, other. A JP presides over far more than the Criminal Code,
+    # so the brief no longer leads with "criminal law rulings: N".
+    jp = briefing.get("jp_counts", {})
+    if jp:
+        lines.append("JP DOCKET AT A GLANCE (decisions in window):")
+        for _name in JP_BUCKET_ORDER:
+            if jp.get(_name):
+                lines.append(f"  {JP_BUCKET_LABELS[_name]}: {jp[_name]}")
+        lines.append("")
+
+    lines.append("BY COURT (decisions in window; backfilled older decisions excluded):")
     court_labels = {
         "scc": "  Supreme Court of Canada",
         "onca": "  Ontario Court of Appeal",
@@ -283,52 +377,110 @@ def format_briefing_text(briefing, hansard_analysis):
 
         lines.append("")
 
-    # ── Precedent-Setting Rulings ──
-    lines.append("\u2500" * 60)
-    lines.append("  PRECEDENT-SETTING RULINGS (Highest Potential)")
-    lines.append("\u2500" * 60)
-
-    shown = 0
-    for c in briefing["highest_precedent"]:
-        if c["precedent_score"] == 0 and shown >= 5:
-            continue
-        item = c["item"]
-        court = item.get("court", "").upper()
-        title = item.get("title", "Untitled")
-        nc = item.get("neutral_citation", "")
-        date = item.get("date_published", "")
-        desc = item.get("description", "")
-        subjects_str = ", ".join(item.get("subjects", []))
-
-        tag = f" [{nc}]" if nc else ""
-        weight = PRECEDENT_WEIGHT.get(item.get("court", ""), "")
-
+    else:
+        # Say WHY the section is absent. Silence here is indistinguishable from a failed
+        # pull, and "the House was not sitting" is a different statement from "no
+        # relevant debate occurred". The Ontario Legislature rises in late June and
+        # does not sit over the summer, so this branch is the normal state for months.
+        lines.append("─" * 60)
+        lines.append("  ONTARIO LEGISLATIVE DEBATES (Current Session 44-1)")
+        lines.append("─" * 60)
+        lines.append("  NO SITTING-WEEK TRANSCRIPTS in this window - the Legislature is not")
+        lines.append("  sitting. This is NOT a finding that no relevant debate occurred; it")
+        lines.append("  means the House was not in session for the period covered.")
+        _hist = (hansard_analysis or {}).get("api_match_count", 0)
+        if _hist:
+            lines.append(f"  Historical corpus matches: {_hist} (not current session)")
         lines.append("")
-        lines.append(f"\u25b6 {court}{tag}")
-        lines.append(f"  {title}")
-        lines.append(f"  {date} | {weight}")
 
-        if subjects_str:
-            lines.append(f"  Subjects: {subjects_str}")
+    def _render_entries(entries, limit):
+        """Render up to `limit` classified entries, each labelled with its coverage tier."""
+        shown = 0
+        for c in entries:
+            if shown >= limit:
+                break
+            item = c["item"]
+            court = item.get("court", "").upper()
+            title = item.get("title", "Untitled")
+            nc = item.get("neutral_citation", "")
+            date = item.get("decision_date") or item.get("date_published", "")
+            tier = c.get("coverage_tier", "metadata_only")
+            keywords = (item.get("keywords") or "").strip()
+            desc = (item.get("description") or "").strip()
+            # The SCC feed's description is "<subjects> - New document published on <date>".
+            # Strip the date clause wherever it appears and keep the subject.
+            if "new document published" in desc.lower():
+                desc = re.sub(r"\s*[-–—]?\s*new document published on [\d\-]+\.?",
+                              "", desc, flags=re.IGNORECASE).strip(" -–—")
 
-        if desc:
-            clean_desc = desc.replace("<br/>", "\n").replace("<br />", "\n")
-            clean_desc = clean_desc.replace("&lt;", "<").replace("&gt;", ">")
-            para_lines = [l.strip() for l in clean_desc.split("\n") if l.strip() and "\u2014" in l][:3]
-            for pl in para_lines[:3]:
-                lines.append(f"    {pl}")
+            # Label every entry with what was actually seen. A CanLII brief is the
+            # court's own structured synopsis, not the judgment, and the reader must
+            # never have to guess which one they are looking at.
+            tier_label = {
+                "full_text": "FULL JUDGMENT TEXT",
+                "metadata_only": "SYNOPSIS ONLY \u2014 judgment not read",
+            }.get(tier, tier.upper())
 
-        if c["precedent_indicators"]:
-            flags = ", ".join(c["precedent_indicators"][:5])
-            lines.append(f"    \u2691 Precedent signals: {flags}")
+            tag = f" [{nc}]" if nc else ""
+            weight = PRECEDENT_WEIGHT.get(item.get("court", ""), "")
 
-        url = item.get("url", "")
-        if url:
-            lines.append(f"    {url}")
+            lines.append("")
+            lines.append(f"\u25b6 {court}{tag}  \u2014  {tier_label}")
+            lines.append(f"  {title}")
+            lines.append(f"  {date} | {weight}")
 
-        shown += 1
-        if shown >= 8:
-            break
+            if keywords:
+                # Ontario: blocks separated by " | ", each block itself em-dash separated
+                # ("Subject — Issue — Holding — Disposition"). Split on both, or the whole
+                # 1,800-character blob prints as a single unreadable line.
+                blocks = [b.strip() for b in re.split(r"\s*\|\s*|\n", keywords) if b.strip()]
+                for blk in blocks[:3]:
+                    if len(blk) > 320:
+                        blk = blk[:320].rsplit(" ", 1)[0] + "\u2026"
+                    lines.append(f"    {blk}")
+                if len(blocks) > 3:
+                    lines.append(f"    (+{len(blocks) - 3} further issue(s) on CanLII)")
+            elif desc:
+                clean_desc = desc.replace("<br/>", "\n").replace("<br />", "\n")
+                clean_desc = clean_desc.replace("&lt;", "<").replace("&gt;", ">")
+                for pl in [l.strip() for l in clean_desc.split("\n") if l.strip()][:3]:
+                    lines.append(f"    {pl}")
+
+            if c["precedent_indicators"]:
+                flags = ", ".join(c["precedent_indicators"][:5])
+                lines.append(f"    \u2691 Precedent signals: {flags}")
+
+            url = item.get("url", "")
+            if url:
+                lines.append(f"    {url}")
+            if item.get("full_text_path"):
+                lines.append(f"    Text on disk: {item['full_text_path']}")
+
+            shown += 1
+
+    # ── JP sections, in the JP's reading order ──
+    # Charter first, then bail, then provincial offences: a JP presides over those far
+    # more often than a Criminal Code trial, and the brief used to bury all of it under
+    # one "criminal law" heading. Order comes from classify.JP_BUCKET_ORDER.
+    for _name in JP_BUCKET_ORDER:
+        _entries = (briefing.get("jp_sections") or {}).get(_name) or []
+        if not _entries:
+            continue
+        lines.append("")
+        lines.append("─" * 60)
+        lines.append(f"  {JP_BUCKET_LABELS[_name]} ({len(_entries)})")
+        lines.append("─" * 60)
+        _render_entries(_entries, len(_entries))
+
+    # Any full-text judgment not shown above is still listed, so retrieving a real
+    # judgment never results in displaying none of them.
+    _left = briefing.get("fulltext_leftover") or []
+    if _left:
+        lines.append("")
+        lines.append("─" * 60)
+        lines.append("  FULL JUDGMENT TEXT RETRIEVED (not shown above)")
+        lines.append("─" * 60)
+        _render_entries(_left, 5)
 
     lines.append("")
     lines.append("\u2500" * 60)
@@ -350,7 +502,21 @@ def main():
     cutoff_date = get_last_report_cutoff()
     print(f"Reporting cutoff: {cutoff_date} (only rulings from {cutoff_date} onward)")
 
-    rulings = load_recent_data("rulings_", cutoff_date=cutoff_date)
+    # Load every source tier, richest first (merge_records keeps the first seen).
+    raw = []
+    for prefix in ("federal_", "scc_", "canlii_", "rulings_"):
+        got = load_recent_data(prefix, cutoff_date=cutoff_date)
+        if got:
+            print(f"  loaded {len(got):4} from {prefix}*")
+        raw.extend(got)
+    rulings = merge_records(raw)
+    # HARD FILTER on decision date. Undated records cannot be shown to fall inside the
+    # window, so they are excluded — but counted, never dropped silently.
+    _before = len(rulings)
+    _undated = sum(1 for r in rulings if not decision_date_of(r))
+    rulings = [r for r in rulings if decision_date_of(r) >= cutoff_date]
+    print(f"  merged to {_before} unique rulings; {len(rulings)} decided {cutoff_date} onward "
+          f"(dropped {_undated} undated, {_before - _undated - len(rulings)} decided before cutoff)")
     hansard = load_recent_data("hansard_", cutoff_date=cutoff_date)
 
     print(f"Loaded {len(rulings)} rulings, {len(hansard)} Hansard entries")
