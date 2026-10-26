@@ -24,6 +24,20 @@ set -uo pipefail
 DIR="$HOME/.hermes/court-rulings"
 TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
 
+# Interpreter: MUST be /usr/bin/python3, because PyMuPDF (fitz) lives only there.
+# `python3` on the gateway PATH resolves to a Hermes venv on 3.14 with no fitz, which
+# silently degraded every full-text tier to "synopsis only" (found 2026-10-25).
+# `env -u PYTHONPATH` stops the inherited Hermes site-packages from shadowing this one.
+PY="env -u PYTHONPATH /usr/bin/python3"
+
+# Hard check: fail loudly at the top rather than emitting a pipeline whose full-text
+# steps quietly return nothing.
+if ! $PY -c "import fitz" >/dev/null 2>&1; then
+  echo "FATAL: $PY cannot import PyMuPDF (fitz) — full judgment text would be empty." >&2
+  exit 3
+fi
+
+
 # CanLII REST API key (metadata API). Kept outside any repo at ~/.hermes/canlii_api_key.txt
 # (chmod 600). Plan limits: 5,000 queries/day, 2 req/s, 1 concurrent request;
 # metadata only (no document text, no full-text search).
@@ -54,14 +68,14 @@ echo "[$TIMESTAMP] === Court Rulings Pipeline ==="
 echo ""
 cd "$DIR" || exit 1
 
-step "Step 1/6: SCC feed + federal list" python3 pull_rulings.py
-step "Step 2/6: Ontario rulings (CanLII API)" python3 pull_canlii_api.py --criminal-only
-step "Step 3/6: Federal courts (FCA/FCT) + full text" python3 pull_federal.py
-step "Step 4/6: SCC full judgment text" python3 pull_scc_text.py
-step "Step 5/6: Ontario Hansard debates" python3 pull_hansard.py
+step "Step 1/6: SCC feed + federal list" $PY pull_rulings.py
+step "Step 2/6: Ontario rulings (CanLII API)" $PY pull_canlii_api.py --criminal-only
+step "Step 3/6: Federal courts (FCA/FCT) + full text" $PY pull_federal.py
+step "Step 4/6: SCC full judgment text" $PY pull_scc_text.py
+step "Step 5/6: Ontario Hansard debates" $PY pull_hansard.py
 
 echo "=== Step 6/6: Generating briefing ==="
-if ! python3 analyze_rulings.py; then
+if ! $PY analyze_rulings.py; then
   echo "!! FATAL: briefing generation failed."
   exit 1
 fi

@@ -117,9 +117,10 @@ def extract_pdf_text(url):
         txt = re.sub(r"<(script|style).*?</\1>", " ", txt, flags=re.S)
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", txt)).strip()
     try:
-        import fitz  # PyMuPDF — present under python3, NOT python3.12
+        import fitz  # PyMuPDF — lives under /usr/bin/python3 only
     except ImportError:
-        print("  WARN: PyMuPDF not importable; run with `python3`, not python3.12",
+        print("  WARN: PyMuPDF not importable — run this under /usr/bin/python3 "
+              "(the cron wrapper sets PY for exactly this reason)",
               file=sys.stderr)
         return ""
     tmp = "/tmp/_federal_doc.pdf"
