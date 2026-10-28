@@ -8,8 +8,9 @@
 #   2. pull_canlii_api.py  Ontario   -> data/canlii_*.jsonl       (metadata + keywords synopsis)
 #   3. pull_federal.py     FCA/FCT   -> data/federal_*.jsonl      (+ full judgment text)
 #   4. pull_scc_text.py    SCC       -> data/scc_*.jsonl          (+ full judgment text)
-#   5. pull_hansard.py     Ontario legislature -> data/hansard_*.jsonl
-#   6. analyze_rulings.py  -> reports/briefing_*.txt
+#   5. backfill_text.py    SCC/FCA/FCT -> text + data/*_backfill_*.jsonl (English only)
+#   6. pull_hansard.py     Ontario legislature -> data/hansard_*.jsonl
+#   7. analyze_rulings.py  -> reports/briefing_*.txt
 #
 # COMPLIANCE: canlii.org and ontariocourts.ca both disallow automated retrieval. Ontario
 # data comes from the sanctioned CanLII REST API (metadata + synopsis only, never the
@@ -68,13 +69,17 @@ echo "[$TIMESTAMP] === Court Rulings Pipeline ==="
 echo ""
 cd "$DIR" || exit 1
 
-step "Step 1/6: SCC feed + federal list" $PY pull_rulings.py
-step "Step 2/6: Ontario rulings (CanLII API)" $PY pull_canlii_api.py --criminal-only
-step "Step 3/6: Federal courts (FCA/FCT) + full text" $PY pull_federal.py
-step "Step 4/6: SCC full judgment text" $PY pull_scc_text.py
-step "Step 5/6: Ontario Hansard debates" $PY pull_hansard.py
+step "Step 1/7: SCC feed + federal list" $PY pull_rulings.py
+step "Step 2/7: Ontario rulings (CanLII API)" $PY pull_canlii_api.py --criminal-only
+step "Step 3/7: Federal courts (FCA/FCT) + full text" $PY pull_federal.py
+step "Step 4/7: SCC full judgment text" $PY pull_scc_text.py
+# Retries archived records whose document 404'd in an earlier week, and any case the
+# per-court --limit skipped. English only: a French-language decision is marked
+# fr_only and never re-requested (see backfill_text.py). 40 fetches = ~2 min at 3 s.
+step "Step 5/7: English full-text backfill" $PY backfill_text.py --limit 40
+step "Step 6/7: Ontario Hansard debates" $PY pull_hansard.py
 
-echo "=== Step 6/6: Generating briefing ==="
+echo "=== Step 7/7: Generating briefing ==="
 if ! $PY analyze_rulings.py; then
   echo "!! FATAL: briefing generation failed."
   exit 1

@@ -90,9 +90,12 @@ def load_recent_data(prefix, cutoff_date=None):
     for fname in sorted(os.listdir(DATA_DIR)):
         if not fname.startswith(prefix) or not fname.endswith(".jsonl"):
             continue
-        # Extract date from filename: prefix_YYYY-MM-DD.jsonl
+        # Extract date from filename: prefix_YYYY-MM-DD.jsonl.
+        # `*_backfill_*` files are exempt: they are written on the day a case's text
+        # was RETRIEVED, not the day it was decided. Filtering them by filename would
+        # drop a backfilled judgment out of the window the week after it was fetched.
         m = re.search(r'(\d{4}-\d{2}-\d{2})', fname)
-        if cutoff_date and m and m.group(1) < cutoff_date:
+        if cutoff_date and m and m.group(1) < cutoff_date and "_backfill_" not in fname:
             continue
         path = os.path.join(DATA_DIR, fname)
         with open(path) as f:
@@ -105,21 +108,39 @@ def load_recent_data(prefix, cutoff_date=None):
     return entries
 
 
+def _record_richness(rec):
+    """How much usable content a record carries. Used to break duplicate ties.
+
+    A backfilled record can arrive AFTER the metadata-only record for the same case
+    (the daily pull's file sorts before `<court>_backfill_<date>.jsonl`), so
+    first-wins would silently discard the judgment text we just retrieved.
+    """
+    text = 1 if (rec.get("full_text_path") or rec.get("text_chars")) else 0
+    has_cite = 1 if (rec.get("neutral_citation") or rec.get("citation")) else 0
+    return (text, int(rec.get("text_chars") or 0), has_cite,
+            len(rec.get("description") or "") + len(rec.get("keywords") or ""))
+
+
 def merge_records(records):
     """Collapse the same case arriving from several sources into one record.
 
-    Keeps the FIRST record seen for each fingerprint, which is why the loader feeds
-    the richest tier first (federal_ -> scc_ -> canlii_ -> rulings_). A full-text
-    record must never be replaced by the bare SCC feed record for the same case.
+    The RICHEST record wins. The loader feeds tiers richest-first
+    (federal_ -> scc_ -> canlii_ -> rulings_), which used to make "first wins" look
+    correct, but a backfill file sorts after its own tier's daily pull. Comparing
+    richness keeps the contract true either way.
     """
-    seen, out = set(), []
+    index, out = {}, []
     for rec in records:
         fp = resolve_fingerprint(rec)
-        if fp and fp in seen:
+        if not fp:
+            out.append(rec)
             continue
-        if fp:
-            seen.add(fp)
-        out.append(rec)
+        if fp not in index:
+            index[fp] = len(out)
+            out.append(rec)
+            continue
+        if _record_richness(rec) > _record_richness(out[index[fp]]):
+            out[index[fp]] = rec
     return out
 
 
